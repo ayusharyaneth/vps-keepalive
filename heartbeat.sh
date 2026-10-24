@@ -2,9 +2,15 @@
 # heartbeat.sh — part of vps-keepalive
 #
 # Runs a harmless command (default: uptime) immediately at startup and then
-# once every VPS_KEEPALIVE_INTERVAL seconds (default: 1200 = 20 minutes).
-# All events are appended to ~/.local/state/vps-keepalive/heartbeat.log with
-# timestamps in Indian Standard Time (Asia/Kolkata, UTC+05:30).
+# once every VPS_KEEPALIVE_INTERVAL seconds (default: 1200 = 20 minutes),
+# optionally split into VPS_KEEPALIVE_BEATS evenly spaced sub-beats (e.g.
+# INTERVAL=1800 with BEATS=5 -> one beat every 6 minutes). All events are
+# appended to ~/.local/state/vps-keepalive/heartbeat.log with timestamps in
+# Indian Standard Time (Asia/Kolkata, UTC+05:30).
+#
+# TIP: `uptime` generates no measurable CPU/disk activity. If your provider
+# monitors resource usage, set VPS_KEEPALIVE_CMD=workload so each beat runs
+# vps-keepalive-workload (real CPU + disk work, still fully local).
 #
 # NOTE: this only generates activity *inside the VPS*. Whether that prevents
 # suspension depends entirely on your provider's activity-detection policy.
@@ -15,6 +21,7 @@
 set -u
 
 INTERVAL="${VPS_KEEPALIVE_INTERVAL:-1200}"
+BEATS="${VPS_KEEPALIVE_BEATS:-1}"
 HEARTBEAT_CMD="${VPS_KEEPALIVE_CMD:-uptime}"
 STATE_DIR="${VPS_KEEPALIVE_STATE_DIR:-${HOME:-/tmp}/.local/state/vps-keepalive}"
 LOG_FILE="${STATE_DIR}/heartbeat.log"
@@ -29,6 +36,23 @@ esac
 if [ "$INTERVAL" -lt 1 ]; then
   printf 'vps-keepalive: VPS_KEEPALIVE_INTERVAL must be at least 1 second\n' >&2
   exit 1
+fi
+
+# BEATS divides one interval into evenly spaced beats. INTERVAL=1800 with
+# BEATS=5 means one beat every 6 minutes (five beats per 30-minute window).
+case "$BEATS" in
+  ''|*[!0-9]*)
+    printf 'vps-keepalive: VPS_KEEPALIVE_BEATS must be a positive integer (got %q)\n' "$BEATS" >&2
+    exit 1
+    ;;
+esac
+if [ "$BEATS" -lt 1 ]; then
+  printf 'vps-keepalive: VPS_KEEPALIVE_BEATS must be at least 1\n' >&2
+  exit 1
+fi
+STEP=$(( INTERVAL / BEATS ))
+if [ "$STEP" -lt 1 ]; then
+  STEP=1
 fi
 
 # Current time formatted for Asia/Kolkata (IST, UTC+05:30, no DST).
@@ -95,13 +119,14 @@ run_beat() {
   return 0
 }
 
-log INFO "startup: pid=$$ interval=${INTERVAL}s command='${HEARTBEAT_CMD}' log=${LOG_FILE}"
+log INFO "startup: pid=$$ interval=${INTERVAL}s beats=${BEATS}/interval (every ${STEP}s) command='${HEARTBEAT_CMD}' log=${LOG_FILE}"
 
-# Heartbeat runs immediately once, then after every INTERVAL.
-# sleep runs in the background and is reaped via `wait` so that termination
-# signals interrupt the sleep immediately instead of waiting it out.
+# Heartbeat runs immediately once, then after every STEP seconds — with
+# BEATS=1 that is exactly one beat per INTERVAL; higher BEATS spread more
+# beats across the same window so at least one lands inside whatever
+# sampling window the provider uses.
 while :; do
   run_beat
-  sleep "$INTERVAL" &
+  sleep "$STEP" &
   wait "$!" 2>/dev/null || true
 done

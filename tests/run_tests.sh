@@ -60,14 +60,14 @@ LOG_FILE="$VPS_KEEPALIVE_STATE_DIR/heartbeat.log"
 printf '\n== 1. Shell syntax ==\n'
 # Note: *.bats files use Bats syntax and are validated by bats itself in CI;
 # bash -n cannot parse `@test "..." { ... }` blocks.
-for f in "$ROOT/heartbeat.sh" "$ROOT/vps-keepalive" "$ROOT/install.sh" \
+for f in "$ROOT/heartbeat.sh" "$ROOT/vps-keepalive" "$ROOT/vps-keepalive-workload" "$ROOT/install.sh" \
          "$ROOT/tests/mock/tmux" "$ROOT/tests/run_tests.sh"; do
   check_eq "bash -n $(basename "$f")" "0" "$(bash -n "$f" >/dev/null 2>&1; echo $?)"
 done
 
 printf '\n== 2. ShellCheck (skipped silently if not installed) ==\n'
 if command -v shellcheck >/dev/null 2>&1; then
-  if shellcheck -x "$ROOT/heartbeat.sh" "$ROOT/vps-keepalive" "$ROOT/install.sh" \
+  if shellcheck -x "$ROOT/heartbeat.sh" "$ROOT/vps-keepalive" "$ROOT/vps-keepalive-workload" "$ROOT/install.sh" \
        "$ROOT/tests/mock/tmux" "$ROOT/tests/run_tests.sh"; then
     ok "shellcheck passed"
   else
@@ -81,6 +81,7 @@ printf '\n== 3. Installer (local mode, temp HOME) ==\n'
 HOME="$TEST_HOME" bash "$ROOT/install.sh" >"$TMP/install.out" 2>&1
 check_eq "install.sh exits 0" "0" "$?"
 check "heartbeat installed to BIN_DIR" test -x "$VPS_KEEPALIVE_BIN_DIR/vps-keepalive-heartbeat"
+check "workload installed to BIN_DIR"  test -x "$VPS_KEEPALIVE_BIN_DIR/vps-keepalive-workload"
 check "manager installed to BIN_DIR"   test -x "$VPS_KEEPALIVE_BIN_DIR/vps-keepalive"
 check "state directory created"        test -d "$VPS_KEEPALIVE_STATE_DIR"
 # Idempotency: a second install must succeed too.
@@ -193,11 +194,40 @@ VPS_KEEPALIVE_STATE_DIR="$TMP/hbfail" VPS_KEEPALIVE_INTERVAL=1 VPS_KEEPALIVE_CMD
   bash "$ROOT/heartbeat.sh" >"$TMP/hbfail.stdout" 2>&1 &
 HB_PID=$!
 CLEANUP_PIDS+=("$HB_PID")
-sleep 2.5
+sleep 4
 check "heartbeat survives a failing command" kill -0 "$HB_PID" 2>/dev/null
 check "failing command logged as WARN" grep_q "heartbeat FAILED" "$TMP/hbfail/heartbeat.log"
 kill -TERM "$HB_PID" 2>/dev/null
 wait "$HB_PID" 2>/dev/null
+
+printf '\n== 7b. Workload mode (real-work heartbeat command) ==\n'
+VPS_KEEPALIVE_WORKLOAD_MB=2 bash "$ROOT/vps-keepalive-workload" >"$TMP/w.out" 2>&1
+check_eq "workload burst exits 0" "0" "$?"
+check "workload reports completion" grep_q "workload complete" "$TMP/w.out"
+check "workload reports real work done" grep_q "gzip=" "$TMP/w.out"
+
+# VPS_KEEPALIVE_CMD=workload must resolve to the installed script inside the
+# tmux command string (check what the mock was asked to run).
+VPS_KEEPALIVE_CMD=workload bash "$ROOT/vps-keepalive" start >"$TMP/wl-start.out" 2>&1
+check_eq "start with CMD=workload exits 0" "0" "$?"
+check "tmux session command references the workload script" \
+  grep_q "vps-keepalive-workload" "$MOCK_TMUX_STATE/calls.log"
+bash "$ROOT/vps-keepalive" stop >/dev/null 2>&1
+
+# BEATS: interval split into evenly spaced beats (5 beats / 30 min recipe,
+# scaled down: 6s split into 3 beats = one every 2s).
+HB_STATE_B="$TMP/hbbeats"
+VPS_KEEPALIVE_STATE_DIR="$HB_STATE_B" VPS_KEEPALIVE_INTERVAL=6 VPS_KEEPALIVE_BEATS=3 \
+  VPS_KEEPALIVE_CMD=true bash "$ROOT/heartbeat.sh" >"$TMP/hb.stdout" 2>&1 &
+HB_PID=$!
+CLEANUP_PIDS+=("$HB_PID")
+sleep 11
+kill -TERM "$HB_PID" 2>/dev/null
+wait "$HB_PID" 2>/dev/null
+BEATS_LOG="$HB_STATE_B/heartbeat.log"
+check "startup line reports beats/interval" grep_q "beats=3/interval (every 2s)" "$BEATS_LOG"
+BEATS_N="$(grep -c 'heartbeat ok' "$BEATS_LOG")"
+check "beats repeat at the sub-interval rate (got $BEATS_N beats, need >= 3)" [ "$BEATS_N" -ge 3 ]
 
 printf '\n== 8. Uninstall ==\n'
 bash "$ROOT/vps-keepalive" start >/dev/null 2>&1

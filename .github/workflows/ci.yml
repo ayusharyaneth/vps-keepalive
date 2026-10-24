@@ -14,7 +14,7 @@ jobs:
       - name: Run ShellCheck
         run: |
           shellcheck --version
-          shellcheck -x install.sh vps-keepalive heartbeat.sh \
+          shellcheck -x install.sh vps-keepalive vps-keepalive-workload heartbeat.sh \
             tests/run_tests.sh tests/mock/tmux tests/*.bats
 
   tests:

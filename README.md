@@ -4,9 +4,10 @@
 
 **A lightweight, root-free keep-alive heartbeat for Linux VPSes.**
 
-Runs a harmless command (`uptime` by default) immediately at startup and every
-20 minutes, inside a persistent `tmux` session, with timestamped logging in
-Indian Standard Time.
+Runs a harmless command immediately at startup and on a schedule — either a
+trivial `uptime` every 20 minutes, or a **real-work burst** (CPU + disk
+activity) split into several beats per window — inside a persistent `tmux`
+session, with timestamped logging in Indian Standard Time.
 
 [![CI](https://github.com/ayusharyaneth/vps-keepalive/actions/workflows/ci.yml/badge.svg)](https://github.com/ayusharyaneth/vps-keepalive/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
@@ -75,6 +76,13 @@ SSH session                 tmux server (persists after SSH drops)
 
 - **Zero-config heartbeat** — `uptime` runs immediately at startup, then every
   1200 seconds; interval and command are configurable.
+- **Real-work mode** — set `VPS_KEEPALIVE_CMD=workload` and every beat runs
+  genuine CPU + disk work (random-data generation, compression, hashing,
+  forced sync) that resource-monitoring providers can actually measure. Fully
+  local: no network requests, nothing downloaded.
+- **Multiple beats per window** — `VPS_KEEPALIVE_BEATS=5` with a 30-minute
+  interval fires one beat every 6 minutes, so at least one lands inside
+  whatever sampling window your provider uses.
 - **Survives SSH disconnects** — runs detached in a named `tmux` session.
 - **IST timestamps** — all log lines use Asia/Kolkata (UTC+05:30, no DST),
   with a verified portable fallback when the timezone database is missing.
@@ -140,6 +148,7 @@ Both options install to your home directory (no root, no prompts):
 | --- | --- |
 | `~/.local/bin/vps-keepalive` | Management script |
 | `~/.local/bin/vps-keepalive-heartbeat` | Heartbeat loop |
+| `~/.local/bin/vps-keepalive-workload` | Real-work burst (CPU + disk) |
 | `~/.local/state/vps-keepalive/heartbeat.log` | Append-only activity log |
 
 > [!TIP]
@@ -167,13 +176,14 @@ source ~/.bashrc
 ## Usage
 
 ```bash
-vps-keepalive start      # start the heartbeat (immediate beat + every 20 min)
+vps-keepalive start      # start the heartbeat (immediate beat + schedule)
 vps-keepalive status     # is the tmux session up? is the heartbeat alive?
 vps-keepalive logs       # last 50 log lines (logs -f to follow)
 vps-keepalive attach     # watch the heartbeat tmux window (Ctrl-b d to detach)
 vps-keepalive detach     # detach any attached clients
 vps-keepalive restart    # stop + start
 vps-keepalive stop       # stop everything
+vps-keepalive workload   # run one real-work burst right now (for testing)
 vps-keepalive uninstall  # remove scripts (logs kept; add --purge to delete)
 ```
 
@@ -213,8 +223,10 @@ Everything is driven by environment variables — nothing is hardcoded.
 
 | Variable | Default | Meaning |
 | --- | --- | --- |
-| `VPS_KEEPALIVE_INTERVAL` | `1200` | Seconds between beats (positive integer) |
-| `VPS_KEEPALIVE_CMD` | `uptime` | The harmless command to run each beat |
+| `VPS_KEEPALIVE_INTERVAL` | `1200` | Seconds per full window (positive integer) |
+| `VPS_KEEPALIVE_BEATS` | `1` | Beats per window — beats fire every `INTERVAL / BEATS` seconds |
+| `VPS_KEEPALIVE_CMD` | `uptime` | Command per beat; `workload` selects the real-work burst |
+| `VPS_KEEPALIVE_WORKLOAD_MB` | `16` | Megabytes processed per workload burst (1–512) |
 | `VPS_KEEPALIVE_SESSION` | `vps-keepalive` | tmux session name |
 | `VPS_KEEPALIVE_BIN_DIR` | `~/.local/bin` | Where scripts are installed |
 | `VPS_KEEPALIVE_STATE_DIR` | `~/.local/state/vps-keepalive` | Where logs live |
@@ -226,6 +238,51 @@ VPS_KEEPALIVE_SESSION=vps-keepalive-second \
 VPS_KEEPALIVE_STATE_DIR=~/.local/state/vps-keepalive-second \
   vps-keepalive start
 ```
+
+## Making your provider notice it (real-work mode)
+
+`uptime` costs nothing to run — which is exactly why resource-monitoring
+providers never see it. If your provider's activity detection looks at CPU,
+disk, or hypervisor metrics, switch the heartbeat to **real-work mode**:
+
+```bash
+# One real-work beat every 6 minutes (5 beats per 30-minute window):
+VPS_KEEPALIVE_CMD=workload \
+VPS_KEEPALIVE_INTERVAL=1800 \
+VPS_KEEPALIVE_BEATS=5 \
+  vps-keepalive restart
+```
+
+Each beat then runs `vps-keepalive-workload`, which does a genuine burst of
+work a hypervisor can measure:
+
+1. writes fresh random data to disk (`/dev/urandom` → temp file),
+2. compresses it with `gzip -9` (CPU-heavy — the data is incompressible on
+   purpose), computes its SHA-256, and
+3. forces the writes out with `sync`, then cleans up.
+
+Nothing leaves the machine — no network requests, nothing downloaded, nothing
+installed. Each burst takes roughly 5–15 seconds on a small VPS.
+
+Tune it:
+
+- **Smaller bursts:** `VPS_KEEPALIVE_WORKLOAD_MB=8` (default is 16; range 1–512).
+- **Denser beats:** raise `VPS_KEEPALIVE_BEATS` — e.g. 10 beats per 30-minute
+  window means one burst every 3 minutes.
+- **Test one burst interactively:** `vps-keepalive workload`.
+
+> [!IMPORTANT]
+> Check your provider's terms first. Artificial CPU load is against some
+> free-tier providers' fair-use rules, and providers that bill by CPU
+> minutes will count this workload as usage. Keep `WORKLOAD_MB` modest — a
+> small burst every few minutes is normally enough to register as activity.
+> And as always: whether any of this prevents suspension is decided by your
+> provider's policy, not by this tool.
+
+Your settings are read at `start`/`restart` time and forwarded into the tmux
+session, so they persist across SSH disconnects. To survive reboots, put the
+same environment variables in the `@reboot` crontab line (see
+[Troubleshooting](#troubleshooting)).
 
 ## Multiple VPSes
 

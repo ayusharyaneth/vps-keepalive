@@ -14,7 +14,7 @@
 #   VPS_KEEPALIVE_CMD        heartbeat command      (default: uptime)
 set -euo pipefail
 
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 SESSION="${VPS_KEEPALIVE_SESSION:-vps-keepalive}"
 BIN_DIR="${VPS_KEEPALIVE_BIN_DIR:-${HOME:-$PWD}/.local/bin}"
@@ -22,6 +22,7 @@ STATE_DIR="${VPS_KEEPALIVE_STATE_DIR:-${HOME:-$PWD}/.local/state/vps-keepalive}"
 LOG_FILE="${STATE_DIR}/heartbeat.log"
 MANAGER_BIN="${BIN_DIR}/vps-keepalive"
 HEARTBEAT_BIN="${BIN_DIR}/vps-keepalive-heartbeat"
+WORKLOAD_BIN="${BIN_DIR}/vps-keepalive-workload"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
@@ -46,12 +47,15 @@ Commands:
   logs [N|-f]    Show the last N log lines (default 50); -f follows the log
   attach         Attach to the heartbeat tmux session
   detach         Detach all clients from the session
+  workload       Run one real-work burst immediately (same task the
+                 heartbeat runs when VPS_KEEPALIVE_CMD=workload)
   version        Print the version
   help           Show this help
 
 Configuration via environment variables (all optional):
   VPS_KEEPALIVE_SESSION, VPS_KEEPALIVE_BIN_DIR, VPS_KEEPALIVE_STATE_DIR,
-  VPS_KEEPALIVE_INTERVAL, VPS_KEEPALIVE_CMD
+  VPS_KEEPALIVE_INTERVAL, VPS_KEEPALIVE_CMD, VPS_KEEPALIVE_BEATS,
+  VPS_KEEPALIVE_WORKLOAD_MB
 
 Note: "running" always means the LOCAL heartbeat process is running. It does
 not prove that your hosting provider will treat the VPS as active.
@@ -140,12 +144,31 @@ require_tmux() {
 # Forward the operator's configuration into the tmux session, because an
 # already-running tmux server does not necessarily inherit our environment.
 heartbeat_env_prefix() {
-  local prefix=""
+  local prefix="" cmd
   if [ -n "${VPS_KEEPALIVE_INTERVAL:-}" ]; then
     prefix+="VPS_KEEPALIVE_INTERVAL=$(printf '%q' "$VPS_KEEPALIVE_INTERVAL") "
   fi
+  if [ -n "${VPS_KEEPALIVE_BEATS:-}" ]; then
+    prefix+="VPS_KEEPALIVE_BEATS=$(printf '%q' "$VPS_KEEPALIVE_BEATS") "
+  fi
   if [ -n "${VPS_KEEPALIVE_CMD:-}" ]; then
-    prefix+="VPS_KEEPALIVE_CMD=$(printf '%q' "$VPS_KEEPALIVE_CMD") "
+    cmd="$VPS_KEEPALIVE_CMD"
+    # "workload" is a shortcut for the real-work burst script; resolve it to
+    # a full path because the tmux session's PATH is not guaranteed to
+    # include ~/.local/bin.
+    if [ "$cmd" = "workload" ]; then
+      if [ -f "$WORKLOAD_BIN" ]; then
+        cmd="$WORKLOAD_BIN"
+      elif [ -f "$SCRIPT_DIR/vps-keepalive-workload" ]; then
+        cmd="$SCRIPT_DIR/vps-keepalive-workload"
+      else
+        die "workload script not found. Run 'vps-keepalive install' first."
+      fi
+    fi
+    prefix+="VPS_KEEPALIVE_CMD=$(printf '%q' "$cmd") "
+  fi
+  if [ -n "${VPS_KEEPALIVE_WORKLOAD_MB:-}" ]; then
+    prefix+="VPS_KEEPALIVE_WORKLOAD_MB=$(printf '%q' "$VPS_KEEPALIVE_WORKLOAD_MB") "
   fi
   if [ -n "${VPS_KEEPALIVE_STATE_DIR:-}" ]; then
     prefix+="VPS_KEEPALIVE_STATE_DIR=$(printf '%q' "$VPS_KEEPALIVE_STATE_DIR") "
@@ -317,6 +340,10 @@ cmd_install() {
 
   copy_script "$SCRIPT_DIR/heartbeat.sh" "$HEARTBEAT_BIN"
   chmod 755 "$HEARTBEAT_BIN"
+  if [ -f "$SCRIPT_DIR/vps-keepalive-workload" ]; then
+    copy_script "$SCRIPT_DIR/vps-keepalive-workload" "$WORKLOAD_BIN"
+    chmod 755 "$WORKLOAD_BIN"
+  fi
   if [ -f "$SCRIPT_DIR/vps-keepalive" ]; then
     copy_script "$SCRIPT_DIR/vps-keepalive" "$MANAGER_BIN"
     chmod 755 "$MANAGER_BIN"
@@ -337,7 +364,7 @@ cmd_install() {
   fi
 
   info "Installed:"
-  info "  scripts : $HEARTBEAT_BIN, $MANAGER_BIN"
+  info "  scripts : $HEARTBEAT_BIN, $WORKLOAD_BIN, $MANAGER_BIN"
   info "  logs    : $LOG_FILE"
   info "Next step: vps-keepalive start"
 }
@@ -357,7 +384,8 @@ cmd_uninstall() {
 
   if [ -e "$MANAGER_BIN" ]; then rm -f "$MANAGER_BIN"; fi
   if [ -e "$HEARTBEAT_BIN" ]; then rm -f "$HEARTBEAT_BIN"; fi
-  info "Removed installed scripts (if present): $MANAGER_BIN, $HEARTBEAT_BIN"
+  if [ -e "$WORKLOAD_BIN" ]; then rm -f "$WORKLOAD_BIN"; fi
+  info "Removed installed scripts (if present): $MANAGER_BIN, $HEARTBEAT_BIN, $WORKLOAD_BIN"
 
   if [ "$purge" -eq 1 ]; then
     rm -rf "$STATE_DIR"
@@ -365,6 +393,18 @@ cmd_uninstall() {
   else
     info "Logs kept at $STATE_DIR (delete them with: vps-keepalive uninstall --purge)"
   fi
+}
+
+cmd_workload() {
+  local wl=""
+  if [ -f "$WORKLOAD_BIN" ]; then
+    wl="$WORKLOAD_BIN"
+  elif [ -f "$SCRIPT_DIR/vps-keepalive-workload" ]; then
+    wl="$SCRIPT_DIR/vps-keepalive-workload"
+  else
+    die "workload script not found. Run 'vps-keepalive install' first."
+  fi
+  "$wl"
 }
 
 main() {
@@ -379,6 +419,7 @@ main() {
     logs)             cmd_logs "${@:2}" ;;
     attach)           cmd_attach ;;
     detach)           cmd_detach ;;
+    workload)         cmd_workload ;;
     version|--version|-V) printf 'vps-keepalive %s\n' "$VERSION" ;;
     help|-h|--help)   usage ;;
     *) usage >&2; die "unknown command: $cmd" ;;

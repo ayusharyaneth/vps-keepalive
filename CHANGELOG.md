@@ -3,6 +3,24 @@
 All notable changes to vps-keepalive are documented here.
 Format: [Keep a Changelog](https://keepachangelog.com/) · [Semantic Versioning](https://semver.org/).
 
+## [1.1.0] - 2026-10-24
+
+### Added
+- **Real-work mode**: `vps-keepalive-workload` script — one burst of genuine
+  CPU + disk activity (random data generation, gzip -9 compression, SHA-256
+  hashing, forced `sync`), fully local, no network requests. Enable with
+  `VPS_KEEPALIVE_CMD=workload`; tune with `VPS_KEEPALIVE_WORKLOAD_MB`
+  (default 16).
+- **Multiple beats per interval**: `VPS_KEEPALIVE_BEATS` splits the interval
+  into evenly spaced beats — e.g. `VPS_KEEPALIVE_INTERVAL=1800` with
+  `VPS_KEEPALIVE_BEATS=5` runs one beat every 6 minutes, so at least one
+  lands inside a provider's sampling window.
+- `vps-keepalive workload` subcommand to run one burst interactively.
+
+### Fixed
+- `VPS_KEEPALIVE_CMD`, `VPS_KEEPALIVE_BEATS` and `VPS_KEEPALIVE_WORKLOAD_MB`
+  are now forwarded into the tmux session environment explicitly.
+
 ## [1.0.0] - 2026-10-24
 
 ### Added

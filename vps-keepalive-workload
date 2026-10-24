@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# vps-keepalive-workload — one burst of REAL work for the heartbeat.
+#
+# Unlike `uptime`, this generates measurable CPU and disk activity
+# (random data generation, compression, hashing, forced fsync) that
+# hypervisor-level activity monitors can actually see. Everything runs
+# locally: no network requests, nothing downloaded, nothing installed.
+#
+# Tune the burst size with VPS_KEEPALIVE_WORKLOAD_MB (default 16).
+# Keep it modest: sustained heavy CPU load can violate free-tier
+# providers' fair-use policies. A small burst every few minutes is
+# usually enough to register as activity.
+set -u
+
+MB="${VPS_KEEPALIVE_WORKLOAD_MB:-16}"
+case "$MB" in
+  ''|*[!0-9]*)
+    printf 'vps-keepalive-workload: VPS_KEEPALIVE_WORKLOAD_MB must be a positive integer (got %q)\n' "$MB" >&2
+    exit 1
+    ;;
+esac
+if [ "$MB" -lt 1 ] || [ "$MB" -gt 512 ]; then
+  printf 'vps-keepalive-workload: VPS_KEEPALIVE_WORKLOAD_MB must be between 1 and 512\n' >&2
+  exit 1
+fi
+
+DIR="${TMPDIR:-/tmp}/vps-keepalive-workload.$$"
+RAW="$DIR/data.bin"
+cleanup() { rm -rf "$DIR"; }
+trap cleanup EXIT INT TERM
+
+if ! mkdir -p "$DIR" 2>/dev/null; then
+  printf 'vps-keepalive-workload: cannot create temp dir %s\n' "$DIR" >&2
+  exit 1
+fi
+
+START="$(date +%s 2>/dev/null)" || START=0
+
+# 1. Disk I/O: write fresh random data (never the same bytes twice).
+dd if=/dev/urandom of="$RAW" bs=1M count="$MB" 2>/dev/null || exit 1
+
+# 2. CPU: compress incompressible data — gzip works as hard as it can.
+GZ_BYTES="$(gzip -9 -c "$RAW" 2>/dev/null | wc -c)" || GZ_BYTES=0
+
+# 3. CPU: hash the raw block.
+SHA="$(sha256sum "$RAW" 2>/dev/null | cut -d' ' -f1)" || SHA="unavailable"
+
+# 4. Disk I/O: force the writes out to storage.
+sync 2>/dev/null || true
+
+END="$(date +%s 2>/dev/null)" || END="$START"
+ELAPSED=$(( END - START ))
+printf 'workload complete: %sMiB random data -> gzip=%s bytes, sha256=%s (%ss of real CPU+disk work)\n' \
+  "$MB" "${GZ_BYTES:-0}" "${SHA:-none}" "$ELAPSED"
