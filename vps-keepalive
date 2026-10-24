@@ -1,0 +1,388 @@
+#!/usr/bin/env bash
+# vps-keepalive — management script for a lightweight VPS keep-alive heartbeat.
+#
+# Runs a harmless command (default: uptime) every 20 minutes inside a
+# persistent tmux session named `vps-keepalive`, so it survives SSH
+# disconnection. See README.md for the full picture, including what this
+# tool can and cannot do about provider-side suspension.
+#
+# Configuration (environment variables, all optional):
+#   VPS_KEEPALIVE_SESSION    tmux session name      (default: vps-keepalive)
+#   VPS_KEEPALIVE_BIN_DIR    install directory      (default: ~/.local/bin)
+#   VPS_KEEPALIVE_STATE_DIR  log/state directory    (default: ~/.local/state/vps-keepalive)
+#   VPS_KEEPALIVE_INTERVAL   heartbeat interval s   (default: 1200)
+#   VPS_KEEPALIVE_CMD        heartbeat command      (default: uptime)
+set -euo pipefail
+
+VERSION="1.0.0"
+
+SESSION="${VPS_KEEPALIVE_SESSION:-vps-keepalive}"
+BIN_DIR="${VPS_KEEPALIVE_BIN_DIR:-${HOME:-$PWD}/.local/bin}"
+STATE_DIR="${VPS_KEEPALIVE_STATE_DIR:-${HOME:-$PWD}/.local/state/vps-keepalive}"
+LOG_FILE="${STATE_DIR}/heartbeat.log"
+MANAGER_BIN="${BIN_DIR}/vps-keepalive"
+HEARTBEAT_BIN="${BIN_DIR}/vps-keepalive-heartbeat"
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+info() { printf '%s\n' "$*"; }
+warn() { printf 'Warning: %s\n' "$*" >&2; }
+die()  { printf 'Error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  cat <<'EOF'
+vps-keepalive — lightweight VPS keep-alive heartbeat manager
+
+Usage: vps-keepalive <command>
+
+Commands:
+  install        Copy scripts to ~/.local/bin and create the state directory
+  uninstall      Stop the heartbeat and remove installed scripts (logs kept;
+                 add --purge to also delete logs)
+  start          Start the heartbeat in a detached tmux session
+  stop           Stop the tmux session and any heartbeat processes
+  restart        Restart the heartbeat
+  status         Show whether the tmux session and heartbeat process are running
+  logs [N|-f]    Show the last N log lines (default 50); -f follows the log
+  attach         Attach to the heartbeat tmux session
+  detach         Detach all clients from the session
+  version        Print the version
+  help           Show this help
+
+Configuration via environment variables (all optional):
+  VPS_KEEPALIVE_SESSION, VPS_KEEPALIVE_BIN_DIR, VPS_KEEPALIVE_STATE_DIR,
+  VPS_KEEPALIVE_INTERVAL, VPS_KEEPALIVE_CMD
+
+Note: "running" always means the LOCAL heartbeat process is running. It does
+not prove that your hosting provider will treat the VPS as active.
+EOF
+}
+
+tmux_missing() {
+  cat >&2 <<'EOF'
+Error: tmux is required but was not found in your PATH.
+
+Install it on Ubuntu/Debian:
+    sudo apt update && sudo apt install -y tmux
+
+If you have no sudo access, alternatives that do not need root:
+  1. Ask your VPS administrator to install tmux for you.
+  2. Place a statically linked tmux binary in ~/.local/bin, make it
+     executable (chmod +x), and ensure ~/.local/bin is in your PATH.
+  3. Use a user-space package manager such as Homebrew on Linux or Nix.
+
+The heartbeat script itself does not require tmux, but without it the
+heartbeat will not survive SSH disconnection. See README.md, section
+"Running without tmux", for the trade-offs.
+EOF
+  return 1
+}
+
+# Resolve the heartbeat script to execute: prefer the installed copy, fall
+# back to the copy sitting next to this script (useful before install).
+resolve_heartbeat() {
+  if [ -f "$HEARTBEAT_BIN" ]; then
+    printf '%s\n' "$HEARTBEAT_BIN"
+  elif [ -f "$SCRIPT_DIR/heartbeat.sh" ]; then
+    printf '%s\n' "$SCRIPT_DIR/heartbeat.sh"
+  else
+    die "heartbeat script not found. Run 'vps-keepalive install' first."
+  fi
+}
+
+# List PIDs of processes whose command line contains the heartbeat path.
+# Tries several ps variants because environments differ: Linux/macOS have
+# procps/BSD ps with `-eo`, while minimal systems (e.g. MSYS) only support
+# `ps -ef` or the plain long format.
+heartbeat_pids() { # $1 = heartbeat path
+  local hb="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -f "$hb" 2>/dev/null
+  elif ps -eo pid=,args= >/dev/null 2>&1; then
+    # shellcheck disable=SC2009 # pgrep is tried first; this is the fallback
+    ps -eo pid=,args= 2>/dev/null | grep -F -- "$hb" | grep -v grep | awk '{print $1}'
+  elif ps -ef >/dev/null 2>&1; then
+    # $2 = PID in `ps -ef` output; skip the awk process itself, whose command
+    # line embeds the pattern.
+    ps -ef 2>/dev/null | awk -v pat="$hb" 'index($0, pat) > 0 && $0 !~ /awk -v pat/ {print $2}'
+  fi
+}
+
+is_heartbeat_running() { # $1 = heartbeat path
+  [ -n "$(heartbeat_pids "$1")" ]
+}
+
+stop_heartbeat_processes() { # $1 = heartbeat path, $2 = optional "force"
+  local hb="$1" signal="-TERM" pids
+  if [ "${2:-}" = "force" ]; then
+    signal="-KILL"
+  fi
+  if command -v pkill >/dev/null 2>&1; then
+    # shellcheck disable=SC2086 # signal is a fixed flag, not a path
+    pkill "$signal" -f "$hb" 2>/dev/null || true
+  else
+    pids="$(heartbeat_pids "$hb")"
+    if [ -n "$pids" ]; then
+      # shellcheck disable=SC2086 # word splitting is intended for PIDs
+      kill $signal $pids 2>/dev/null || true
+    fi
+  fi
+}
+
+has_session() {
+  tmux has-session -t "$SESSION" 2>/dev/null
+}
+
+require_tmux() {
+  command -v tmux >/dev/null 2>&1 || tmux_missing
+}
+
+# Forward the operator's configuration into the tmux session, because an
+# already-running tmux server does not necessarily inherit our environment.
+heartbeat_env_prefix() {
+  local prefix=""
+  if [ -n "${VPS_KEEPALIVE_INTERVAL:-}" ]; then
+    prefix+="VPS_KEEPALIVE_INTERVAL=$(printf '%q' "$VPS_KEEPALIVE_INTERVAL") "
+  fi
+  if [ -n "${VPS_KEEPALIVE_CMD:-}" ]; then
+    prefix+="VPS_KEEPALIVE_CMD=$(printf '%q' "$VPS_KEEPALIVE_CMD") "
+  fi
+  if [ -n "${VPS_KEEPALIVE_STATE_DIR:-}" ]; then
+    prefix+="VPS_KEEPALIVE_STATE_DIR=$(printf '%q' "$VPS_KEEPALIVE_STATE_DIR") "
+  fi
+  printf '%s' "$prefix"
+}
+
+cmd_start() {
+  require_tmux
+  local hb env_prefix
+  hb="$(resolve_heartbeat)"
+  if ! mkdir -p "$STATE_DIR" 2>/dev/null; then
+    die "cannot create state directory: $STATE_DIR"
+  fi
+
+  if has_session; then
+    if is_heartbeat_running "$hb"; then
+      info "Already running: tmux session '$SESSION' has a live heartbeat. Nothing to do."
+      return 0
+    fi
+    warn "stale tmux session '$SESSION' without a live heartbeat; replacing it."
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    stop_heartbeat_processes "$hb"
+    sleep 1
+  else
+    # No tmux session, but an orphaned heartbeat may have survived (for
+    # example if the tmux server died without reaping children).
+    if is_heartbeat_running "$hb"; then
+      warn "orphaned heartbeat process found without a tmux session; stopping it first."
+      stop_heartbeat_processes "$hb"
+      sleep 1
+    fi
+  fi
+
+  env_prefix="$(heartbeat_env_prefix)"
+  if ! tmux new-session -d -s "$SESSION" -n heartbeat "${env_prefix}${hb}"; then
+    die "failed to create tmux session '$SESSION'. Is tmux working? Try: tmux kill-server"
+  fi
+  sleep 1
+
+  if ! has_session; then
+    die "tmux session '$SESSION' exited immediately. Check the log: $LOG_FILE"
+  fi
+  if ! is_heartbeat_running "$hb"; then
+    warn "tmux session '$SESSION' is up, but the heartbeat process is not running."
+    warn "Check the log for errors: $LOG_FILE"
+    return 1
+  fi
+  info "Started: tmux session '$SESSION' is running the heartbeat (immediately at start, then every configured interval)."
+  info "Logs: $LOG_FILE — view with: vps-keepalive logs"
+}
+
+cmd_stop() {
+  require_tmux
+  local hb stopped=0
+  hb="$(resolve_heartbeat 2>/dev/null || printf '%s' "$HEARTBEAT_BIN")"
+
+  if has_session; then
+    tmux kill-session -t "$SESSION" 2>/dev/null || true
+    stopped=1
+  fi
+  if is_heartbeat_running "$hb"; then
+    stop_heartbeat_processes "$hb"
+    stopped=1
+  fi
+  if [ "$stopped" -eq 1 ]; then
+    sleep 1
+    if is_heartbeat_running "$hb"; then
+      warn "heartbeat process did not exit cleanly; sending SIGKILL."
+      stop_heartbeat_processes "$hb" force
+    fi
+    info "Stopped: session '$SESSION' killed and heartbeat processes terminated."
+  else
+    info "Not running. Nothing to stop."
+  fi
+}
+
+cmd_restart() {
+  # stop is allowed to report "not running" without failing the restart.
+  cmd_stop || true
+  cmd_start
+}
+
+cmd_status() {
+  local hb in_tmux=0 running=0 last_line=""
+  hb="$(resolve_heartbeat 2>/dev/null || printf '%s' "$HEARTBEAT_BIN")"
+
+  if command -v tmux >/dev/null 2>&1 && has_session; then
+    in_tmux=1
+  fi
+  if is_heartbeat_running "$hb"; then
+    running=1
+  fi
+
+  if [ "$in_tmux" -eq 1 ]; then
+    info "tmux session : running ('$SESSION')"
+  else
+    info "tmux session : not running"
+  fi
+  if [ "$running" -eq 1 ]; then
+    info "heartbeat    : process alive"
+  else
+    info "heartbeat    : not running"
+  fi
+  if [ -f "$LOG_FILE" ]; then
+    last_line="$(tail -n 1 "$LOG_FILE" 2>/dev/null || true)"
+    if [ -n "$last_line" ]; then
+      info "last log     : $last_line"
+    fi
+  fi
+
+  if [ "$running" -eq 1 ]; then
+    info ""
+    info "This confirms only that the LOCAL heartbeat process is running."
+    info "It does not verify that your provider counts the VPS as active;"
+    info "suspension policies are provider-side. See README.md for details."
+    return 0
+  fi
+  return 1
+}
+
+cmd_logs() {
+  local arg="${1:-}"
+  if [ ! -f "$LOG_FILE" ]; then
+    info "No log file yet at $LOG_FILE. Start the heartbeat first: vps-keepalive start"
+    return 0
+  fi
+  case "$arg" in
+    -f|--follow) tail -n 50 -F "$LOG_FILE" ;;
+    '') tail -n 50 "$LOG_FILE" ;;
+    *[!0-9]*)
+      die "usage: vps-keepalive logs [N | -f]  (N must be a number)"
+      ;;
+    *) tail -n "$arg" "$LOG_FILE" ;;
+  esac
+}
+
+cmd_attach() {
+  require_tmux
+  has_session || die "session '$SESSION' is not running. Start it first: vps-keepalive start"
+  tmux attach-session -t "$SESSION"
+}
+
+cmd_detach() {
+  require_tmux
+  has_session || die "session '$SESSION' is not running."
+  if tmux detach-client -s "$SESSION" 2>/dev/null; then
+    info "Detached all clients from session '$SESSION' (the heartbeat keeps running)."
+  else
+    info "No attached clients for session '$SESSION'; nothing to detach."
+  fi
+}
+
+copy_script() { # copy_script SRC DST — idempotent, same-file safe
+  local src="$1" dst="$2"
+  if [ -e "$dst" ] && [ "$src" -ef "$dst" ]; then
+    return 0
+  fi
+  cp -f "$src" "$dst" || die "failed to copy $src -> $dst"
+}
+
+cmd_install() {
+  if [ ! -f "$SCRIPT_DIR/heartbeat.sh" ]; then
+    die "heartbeat.sh not found next to this script ($SCRIPT_DIR). Run this from the repository checkout, or use install.sh."
+  fi
+  if ! mkdir -p "$BIN_DIR" "$STATE_DIR" 2>/dev/null; then
+    die "cannot create directories: $BIN_DIR and $STATE_DIR"
+  fi
+
+  copy_script "$SCRIPT_DIR/heartbeat.sh" "$HEARTBEAT_BIN"
+  chmod 755 "$HEARTBEAT_BIN"
+  if [ -f "$SCRIPT_DIR/vps-keepalive" ]; then
+    copy_script "$SCRIPT_DIR/vps-keepalive" "$MANAGER_BIN"
+    chmod 755 "$MANAGER_BIN"
+  fi
+  # Create the log file so permissions problems surface at install time.
+  touch "$LOG_FILE" 2>/dev/null || warn "could not create log file: $LOG_FILE"
+
+  case ":$PATH:" in
+    *":$BIN_DIR:"*) ;;
+    *)
+      warn "$BIN_DIR is not in your PATH. Add this to ~/.bashrc (or ~/.profile) and reopen your shell:"
+      warn "    export PATH=\"\$HOME/.local/bin:\$PATH\""
+      ;;
+  esac
+
+  if ! command -v tmux >/dev/null 2>&1; then
+    warn "tmux is not installed. The heartbeat will not survive SSH disconnects until it is. See 'vps-keepalive help' or README.md."
+  fi
+
+  info "Installed:"
+  info "  scripts : $HEARTBEAT_BIN, $MANAGER_BIN"
+  info "  logs    : $LOG_FILE"
+  info "Next step: vps-keepalive start"
+}
+
+cmd_uninstall() {
+  local purge=0
+  if [ "${1:-}" = "--purge" ] || [ "${2:-}" = "--purge" ]; then
+    purge=1
+  fi
+
+  # Best-effort stop: uninstall must work even if tmux is gone entirely.
+  if command -v tmux >/dev/null 2>&1 && has_session; then
+    cmd_stop || true
+  elif is_heartbeat_running "$HEARTBEAT_BIN"; then
+    stop_heartbeat_processes "$HEARTBEAT_BIN"
+  fi
+
+  if [ -e "$MANAGER_BIN" ]; then rm -f "$MANAGER_BIN"; fi
+  if [ -e "$HEARTBEAT_BIN" ]; then rm -f "$HEARTBEAT_BIN"; fi
+  info "Removed installed scripts (if present): $MANAGER_BIN, $HEARTBEAT_BIN"
+
+  if [ "$purge" -eq 1 ]; then
+    rm -rf "$STATE_DIR"
+    info "Removed state directory: $STATE_DIR"
+  else
+    info "Logs kept at $STATE_DIR (delete them with: vps-keepalive uninstall --purge)"
+  fi
+}
+
+main() {
+  local cmd="${1:-help}"
+  case "$cmd" in
+    install)          cmd_install "${@:2}" ;;
+    uninstall)        cmd_uninstall "${@:2}" ;;
+    start|up)         cmd_start ;;
+    stop|down)        cmd_stop ;;
+    restart)          cmd_restart ;;
+    status)           cmd_status ;;
+    logs)             cmd_logs "${@:2}" ;;
+    attach)           cmd_attach ;;
+    detach)           cmd_detach ;;
+    version|--version|-V) printf 'vps-keepalive %s\n' "$VERSION" ;;
+    help|-h|--help)   usage ;;
+    *) usage >&2; die "unknown command: $cmd" ;;
+  esac
+}
+
+main "$@"

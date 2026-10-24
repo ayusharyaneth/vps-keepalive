@@ -1,0 +1,4 @@
+# This is a shell-script project: every text file must use LF, including in
+# working-tree checkouts on Windows, or bash rejects the scripts with
+# "bad interpreter" errors.
+* text=auto eol=lf

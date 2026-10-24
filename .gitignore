@@ -1,0 +1,13 @@
+# Logs and local state
+*.log
+state/
+tests/tmp/
+
+# Editor / OS noise
+.DS_Store
+Thumbs.db
+*.swp
+*~
+
+# ShellCheck scratch
+*.log.check

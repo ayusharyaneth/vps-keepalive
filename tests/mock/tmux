@@ -1,0 +1,154 @@
+#!/usr/bin/env bash
+# tests/mock/tmux — a minimal tmux replacement used by the portable test
+# suite so the full start/stop/status flow can be exercised on machines
+# without tmux (e.g. the maintainer's laptop). It simulates detached
+# sessions by really launching the requested command with nohup and
+# remembering its PID, so "session dies when the heartbeat dies" behaves
+# like the real thing.
+#
+# The CI workflow additionally runs the Bats tests against REAL tmux.
+set -u
+
+STATE_DIR="${MOCK_TMUX_STATE:?MOCK_TMUX_STATE is not set}"
+mkdir -p "$STATE_DIR"
+SESSIONS="$STATE_DIR/sessions"
+CALLS="$STATE_DIR/calls.log"
+[ -e "$SESSIONS" ] || : > "$SESSIONS"
+
+log_call() { printf '%s\n' "$*" >>"$CALLS"; }
+
+find_pid() { awk -F'\t' -v s="$1" '$1 == s { print $2 }' "$SESSIONS" 2>/dev/null; }
+pid_alive() { [ -n "${1:-}" ] && kill -0 "$1" 2>/dev/null; }
+
+# real tmux drops a session once its last window process exits; emulate that.
+session_alive() {
+  local pid
+  pid="$(find_pid "$1")"
+  pid_alive "$pid"
+}
+
+# real tmux drops a session once its last window process exits; emulate that
+# by purging entries whose recorded PID is no longer alive.
+purge_dead_sessions() {
+  local tmp="$SESSIONS.purge" name pid
+  : >"$tmp"
+  while IFS="$(printf '\t')" read -r name pid; do
+    [ -n "$name" ] || continue
+    if pid_alive "$pid"; then
+      printf '%s\t%s\n' "$name" "$pid" >>"$tmp"
+    fi
+  done <"$SESSIONS"
+  mv "$tmp" "$SESSIONS"
+  return 0
+}
+purge_dead_sessions
+
+cmd="${1:-}"
+[ $# -gt 0 ] && shift
+log_call "$cmd $*"
+
+case "$cmd" in
+  has-session)
+    target=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    session_alive "$target"
+    ;;
+  new-session)
+    name=""
+    rest=()
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -d) shift ;;
+        -s) name="$2"; shift 2 ;;
+        -n) shift 2 ;;
+        --) shift; rest=("$@"); break ;;
+        -*) shift ;;
+        *)  rest=("$@"); break ;;
+      esac
+    done
+    if [ -z "$name" ]; then
+      echo "mock tmux: new-session requires -s NAME" >&2
+      exit 1
+    fi
+    if session_alive "$name"; then
+      echo "duplicate session: $name" >&2
+      exit 1
+    fi
+    # Real tmux passes the command to "sh -c" as one string; normalize by
+    # word-splitting (test paths contain no spaces), then peel leading
+    # VAR=value assignments into `env`, which execs the target — so the
+    # recorded PID is the heartbeat itself and killing the session kills
+    # it. Close every inherited fd above 2 (bats and CI runners wait on
+    # pipes held by leaked fds) and detach all three std streams, like a
+    # well-behaved daemon launcher.
+    if [ "${#rest[@]}" -eq 1 ]; then
+      # shellcheck disable=SC2206 # word splitting is intended here
+      rest=(${rest[0]})
+    fi
+    envs=()
+    while [ "${rest[0]:-}" != "" ] && [ "${rest[0]:-}" != "${rest[0]#*=}" ]; do
+      envs+=("${rest[0]}")
+      rest=("${rest[@]:1}")
+    done
+    nohup env "${envs[@]}" "${rest[@]}" >/dev/null 2>&1 </dev/null \
+      3>&- 4>&- 5>&- 6>&- 7>&- 8>&- 9>&- 10>&- 11>&- 12>&- &
+    printf '%s\t%s\n' "$name" "$!" >>"$SESSIONS"
+    ;;
+  kill-session)
+    target=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    pid="$(find_pid "$target")"
+    if ! pid_alive "$pid"; then
+      echo "can't find session: $target" >&2
+      exit 1
+    fi
+    kill "$pid" 2>/dev/null || true
+    tmp="$SESSIONS.tmp"
+    awk -F'\t' -v s="$target" '$1 != s' "$SESSIONS" >"$tmp" && mv "$tmp" "$SESSIONS"
+    ;;
+  attach-session)
+    target=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -t) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    session_alive "$target" || { echo "can't find session: $target" >&2; exit 1; }
+    echo "[mock tmux] attached to $target"
+    ;;
+  detach-client)
+    target=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        -s) target="$2"; shift 2 ;;
+        *) shift ;;
+      esac
+    done
+    session_alive "$target" || { echo "can't find session: $target" >&2; exit 1; }
+    ;;
+  list-sessions)
+    found=0
+    while IFS="$(printf '\t')" read -r name pid; do
+      if pid_alive "$pid"; then
+        echo "$name: 1 windows"
+        found=1
+      fi
+    done <"$SESSIONS"
+    [ "$found" -eq 1 ]
+    ;;
+  *)
+    echo "mock tmux: unsupported command '$cmd'" >&2
+    exit 1
+    ;;
+esac

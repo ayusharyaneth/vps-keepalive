@@ -1,0 +1,46 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  shellcheck:
+    name: ShellCheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        run: |
+          shellcheck --version
+          shellcheck -x install.sh vps-keepalive heartbeat.sh \
+            tests/run_tests.sh tests/mock/tmux tests/*.bats
+
+  tests:
+    name: Tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install tmux and bats-core
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux
+          git clone --depth 1 --branch v1.11.0 \
+            https://github.com/bats-core/bats-core.git /tmp/bats-core
+          sudo ln -s /tmp/bats-core/bin/bats /usr/local/bin/bats
+      - name: Show tool versions
+        run: |
+          tmux -V
+          bats --version
+      # Each suite gets its own step and a hard timeout so a hanging test
+      # fails fast (exit 124) with its TAP log instead of stalling the job.
+      - name: Bats — heartbeat.bats
+        run: timeout -k 10 180 bats --tap tests/heartbeat.bats
+      - name: Bats — manager.bats (mock tmux)
+        run: timeout -k 10 180 bats --tap tests/manager.bats
+      - name: Bats — tmux.bats (real tmux)
+        run: timeout -k 10 180 bats --tap tests/tmux.bats
+      - name: Portable suite (mock tmux)
+        run: timeout -k 10 300 ./tests/run_tests.sh
